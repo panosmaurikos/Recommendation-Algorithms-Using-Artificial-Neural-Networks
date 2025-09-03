@@ -9,7 +9,7 @@ import seaborn as sns
 from sklearn.metrics import pairwise_distances, silhouette_score,accuracy_score, mean_absolute_error
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
-from sklearn.neural_network import MLPClassifier
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.model_selection import train_test_split
 from sklearn_extra.cluster import KMedoids
 from sklearn.decomposition import TruncatedSVD
@@ -29,6 +29,23 @@ def plot_histogram(series, title_str):
     plt.savefig(os.path.join(FIGURES_PATH, f"{series.name}.png"), dpi=100, bbox_inches='tight')
     plt.show()
 
+
+# Helper: masked MAE (ignore unrated items where y_true == 0)
+def masked_mae(y_true, y_pred):
+	"""Compute MAE only on positions where y_true != 0.
+	y_true, y_pred: arrays with shape (n_samples, n_items) or (n_items,).
+	"""
+	y_true = np.asarray(y_true)
+	y_pred = np.asarray(y_pred)
+	if y_true.ndim == 1:
+		y_true = y_true.reshape(1, -1)
+		y_pred = y_pred.reshape(1, -1)
+	mask = (y_true != 0)
+	if not np.any(mask):
+		return float('nan')
+	err = np.abs(y_true - y_pred)
+	return float(err[mask].mean())
+	
 
 # ========================================================================
 # Initialization and Data Loading
@@ -378,5 +395,258 @@ for metric_name, labels_dict in [("euclidean", labels_eu), ("cosine", labels_cos
         # save labels
         np.save(os.path.join(datafolder, f"clusters_{metric_name}_k{k}.npy"), lbls)
 print("Clustering completed.")
+
+# -------------------------------------------------------------------------
+# New: Jaccard (metric (5)) distance matrix, clustering and NN per cluster
+# -------------------------------------------------------------------------
+def compute_jaccard_matrix(R_csr):
+    """Compute Jaccard-based distance: 1 - |φ(u)∩φ(v)|/|φ(u)∪φ(v)|"""
+    n = R_csr.shape[0]
+    rows_idx = [set(R_csr[i].indices.tolist()) for i in range(n)]
+    D = np.ones((n, n), dtype=np.float64)
+    t0 = time.time()
+    for i in range(n):
+        Si = rows_idx[i]
+        for j in range(i+1, n):
+            Sj = rows_idx[j]
+            union = Si | Sj
+            if not union:
+                d = 1.0
+            else:
+                inter = len(Si & Sj)
+                d = 1.0 - (inter / len(union))
+            D[i, j] = D[j, i] = d
+        if (i+1) % 200 == 0 or i == n-1:
+            print(f"Jaccard: processed row {i+1}/{n}")
+    print(f"Computed Jaccard distance matrix for n={n} in {time.time()-t0:.1f}s")
+    return D
+
+# Compute jaccard distance matrix (and save)
+dist_jac_file = os.path.join(datafolder, "dist_jaccard.npy")
+if os.path.exists(dist_jac_file):
+    dist_jac = np.load(dist_jac_file)
+else:
+    dist_jac = compute_jaccard_matrix(R_dense)
+    np.save(dist_jac_file, dist_jac)
+
+# Postprocess
+dist_jac[:] = 0.5 * (dist_jac + dist_jac.T)
+np.fill_diagonal(dist_jac, 0.0)
+np.clip(dist_jac, 0.0, None, out=dist_jac)
+
+# Evaluate K (1..10) via KMedoids and silhouette, save elbow/silhouette plots
+ks = list(range(1, 11))
+inertias = []
+sil_scores = []
+labels_per_k = {}
+for k in ks:
+    model = KMedoids(n_clusters=k, metric='precomputed', random_state=1)
+    model.fit(dist_jac)
+    labels = model.labels_
+    labels_per_k[k] = labels
+    inertias.append(model.inertia_)
+    sil = np.nan
+    if k > 1:
+        try:
+            sil = silhouette_score(dist_jac, labels, metric='precomputed')
+        except Exception:
+            sil = np.nan
+    sil_scores.append(sil)
+    print(f"jaccard k={k}: inertia={model.inertia_:.3f}, silhouette={sil}")
+
+# Save elbow/silhouette plots
+plt.figure(figsize=(6,4))
+plt.plot(ks, inertias, 'bx-'); plt.xlabel('k'); plt.ylabel('Distortion'); plt.title('Elbow (Jaccard)'); plt.grid(True)
+plt.savefig(os.path.join(FIGURES_PATH, "elbow_jaccard.png"), dpi=100, bbox_inches='tight'); plt.close()
+
+plt.figure(figsize=(6,4))
+plt.plot(ks, sil_scores, 'rx-'); plt.xlabel('k'); plt.ylabel('Silhouette'); plt.title('Silhouette (Jaccard)'); plt.grid(True)
+plt.savefig(os.path.join(FIGURES_PATH, "silhouette_jaccard.png"), dpi=100, bbox_inches='tight'); plt.close()
+
+# Choose best_k by max silhouette (ignore nan); fallback to 3
+best_k = None
+best_sil = -np.inf
+for k, s in zip(ks, sil_scores):
+    if not np.isnan(s) and s > best_sil:
+        best_sil = s; best_k = k
+if best_k is None:
+    best_k = 3
+print(f"Selected best_k (Jaccard) = {best_k} with silhouette {best_sil:.4f}")
+
+best_labels = labels_per_k[best_k]
+np.save(os.path.join(datafolder, f"clusters_jaccard_k{best_k}.npy"), best_labels)
+
+# -----------------------------
+# Expansion around medoids (Method B)
+# -----------------------------
+# If True create overlapping communities by expanding each medoid with users
+# whose Jaccard similarity to the medoid >= sim_threshold. This yields
+# communities that can overlap.
+OVERLAP_EXPAND = True
+sim_threshold = 0.20  # tune as needed (0.15-0.30 typical)
+
+if OVERLAP_EXPAND:
+	# Re-fit KMedoids for best_k to obtain medoid indices
+	_kmed = KMedoids(n_clusters=best_k, metric='precomputed', random_state=1)
+	_kmed.fit(dist_jac)
+	medoids = _kmed.medoid_indices_
+
+	# similarity matrix
+	sim = 1.0 - dist_jac
+
+	overlap_communities = []
+	for m in medoids:
+		members = set(np.where(sim[m, :] >= sim_threshold)[0].tolist())
+		# ensure medoid itself included
+		members.add(int(m))
+		overlap_communities.append(members)
+
+	# Save communities for inspection
+	np.save(os.path.join(datafolder, f"overlap_communities_k{best_k}_th{int(sim_threshold*100)}.npy"),
+			np.array([list(c) for c in overlap_communities], dtype=object))
+	print(f"Built {len(overlap_communities)} overlapping communities via expansion (threshold={sim_threshold})")
+else:
+	# fallback: use partition labels (no overlaps)
+	overlap_communities = [set(np.where(best_labels == cl)[0].tolist()) for cl in np.unique(best_labels)]
+	print(f"Using non-overlapping partition (num clusters={len(overlap_communities)})")
+
+# 2D embedding reuse (X2 computed earlier) if exists; otherwise compute
+try:
+	X2
+except NameError:
+	X2 = embed_2d(R_dense, svd_components=50)
+
+# Optional: save a scatter colored by medoid expansion membership of first community (visual check)
+plt.figure(figsize=(8,6))
+# color by community membership of first community (0/1), for quick check
+first_mask = np.zeros(R_dense.shape[0], dtype=int)
+if len(overlap_communities) > 0:
+	first_mask[list(overlap_communities[0])] = 1
+plt.scatter(X2[:,0], X2[:,1], c=first_mask, cmap='coolwarm', s=12, alpha=0.8)
+plt.title(f'Example membership for community 0 (threshold={sim_threshold})')
+plt.savefig(os.path.join(FIGURES_PATH, f"example_overlap_comm0_k{best_k}.png"), dpi=100, bbox_inches='tight')
+plt.close()
+
+# -------------------------------------------------------------------------
+# Replace downstream loop: iterate over overlap_communities (which may overlap)
+# -------------------------------------------------------------------------
+results = []
+n_items = R_dense.shape[1]
+
+for cid, comm in enumerate(overlap_communities):
+	cluster_idx = np.array(sorted(list(comm)), dtype=int)
+	m = len(cluster_idx)
+	if m < 2:
+		print(f"Community {cid} too small (m={m}), skipping.")
+		continue
+	k_neighbors = min(10, m - 1)
+	X_rows = []
+	Y_rows = []
+	for u in cluster_idx:
+		# distances from u to others in community (use dist_jac)
+		dists = dist_jac[u, cluster_idx]
+		order = np.argsort(dists)
+		# find self position inside cluster_idx
+		self_pos_arr = np.where(cluster_idx == u)[0]
+		if self_pos_arr.size == 0:
+			# safety: if u not found (shouldn't happen) skip
+			continue
+		self_pos = self_pos_arr[0]
+		# exclude self and take top k_neighbors
+		neighbor_pos = order[order != self_pos][:k_neighbors]
+		if neighbor_pos.size < k_neighbors:
+			neighbor_pos = np.pad(neighbor_pos, (0, k_neighbors - neighbor_pos.size), mode='wrap')
+		neighbors = cluster_idx[neighbor_pos]
+		# build feature: concatenate neighbor rating vectors
+		neighbor_vectors = [R_dense[int(nbr)].toarray().flatten() for nbr in neighbors]
+		feature = np.hstack(neighbor_vectors)
+		label = R_dense[int(u)].toarray().flatten()
+		X_rows.append(feature)
+		Y_rows.append(label)
+	X = np.vstack(X_rows)
+	Y = np.vstack(Y_rows)
+	# if too few samples skip
+	if X.shape[0] < 2:
+		print(f"Community {cid} insufficient samples ({X.shape[0]}), skipping NN training.")
+		continue
+	# Train/test split (per-user)
+	X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.1, random_state=42)
+	# Train MLPRegressor (multioutput)
+	model = MLPRegressor(hidden_layer_sizes=(100,50), max_iter=300, random_state=42)
+	model.fit(X_train, y_train)
+	y_train_pred = model.predict(X_train)
+	y_test_pred = model.predict(X_test)
+	# Use masked MAE (ignore unrated items in y_true)
+	train_mae = masked_mae(y_train, y_train_pred)
+	test_mae = masked_mae(y_test, y_test_pred)
+	results.append({
+		"community_id": int(cid),
+		"community_size": int(m),
+		"k_neighbors": int(k_neighbors),
+		"train_mae": float(train_mae),
+		"test_mae": float(test_mae)
+	})
+	print(f"Community {cid}: size={m}, k={k_neighbors}, train_MAE={train_mae:.4f}, test_MAE={test_mae:.4f}")
+	# Save a sample reconstruction plot for this community (first test sample)
+	if X_test.shape[0] > 0:
+		plt.figure(figsize=(8,3))
+		plt.plot(y_test[0], label='true', alpha=0.7)
+		plt.plot(y_test_pred[0], label='pred', alpha=0.7)
+		plt.title(f'Community {cid} sample true vs pred (first test user)')
+		plt.legend(); plt.grid(True)
+		plt.savefig(os.path.join(FIGURES_PATH, f"nn_comm{cid}_sample.png"), dpi=100, bbox_inches='tight')
+		plt.close()
+
+# Save results table
+if results:
+	results_df = pd.DataFrame(results).sort_values('community_id')
+	results_df.to_csv(os.path.join(datafolder, f"nn_overlap_results_k{best_k}_th{int(sim_threshold*100)}.csv"), index=False)
+	print("Saved NN community results to", os.path.join(datafolder, f"nn_overlap_results_k{best_k}_th{int(sim_threshold*100)}.csv"))
+else:
+	print("No NN results to save (no communities trained).")
+
+# =========================
+#  Export user-user graph for Gephi/network analysis
+# =========================
+
+# Build user_items_dict: user index -> set of rated item indices
+user_items_dict = {}
+for uidx in range(R_dense.shape[0]):
+    user_items_dict[uidx] = set(R_dense[uidx].indices.tolist())
+
+user_ids = list(user_items_dict.keys())
+user_ids.sort()
+n_users = len(user_ids)
+
+# Compute W (Jaccard similarity) and CommonRatings (intersection size)
+adjacency_numpy_file = os.path.join(datafolder, "W.npy")
+common_ratings_numpy_file = os.path.join(datafolder, "CommonRatings.npy")
+if os.path.exists(adjacency_numpy_file):
+    W = np.load(adjacency_numpy_file, allow_pickle=True)
+    CommonRatings = np.load(common_ratings_numpy_file, allow_pickle=True)
+else:
+    W = np.zeros((n_users, n_users))
+    CommonRatings = np.zeros((n_users, n_users))
+    for i in user_ids:
+        items_i = user_items_dict[i]
+        for j in user_ids:
+            items_j = user_items_dict[j]
+            inter = items_i & items_j
+            union = items_i | items_j
+            W[i, j] = len(inter) / len(union) if len(union) > 0 else 0.0
+            CommonRatings[i, j] = len(inter)
+    np.save(adjacency_numpy_file, W)
+    np.save(common_ratings_numpy_file, CommonRatings)
+
+# Export to GML for Gephi
+graph_file = os.path.join(datafolder, "recommendation_network.gml")
+G = nx.from_numpy_array(CommonRatings)
+if not os.path.exists(graph_file):
+    nx.write_gml(G, graph_file)
+    print(f"Exported user-user CommonRatings graph to {graph_file}")
+    G = nx.read_gml("datafiles/recommendation_network.gml")
+    print(nx.info(G))
+else:
+    print(f"GML file already exists at {graph_file}")
 
 
