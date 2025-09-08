@@ -615,7 +615,8 @@ if not os.path.exists(graph_file):
     nx.write_gml(G, graph_file)
     print(f"Exported user-user CommonRatings graph to {graph_file}")
     G = nx.read_gml("datafiles/recommendation_network.gml")
-    print(nx.info(G))
+    print(f"Graph info: nodes={G.number_of_nodes()}, edges={G.number_of_edges()}")
+
 else:
     print(f"GML file already exists at {graph_file}")
 
